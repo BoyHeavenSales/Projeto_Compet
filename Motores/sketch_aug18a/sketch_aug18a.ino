@@ -13,6 +13,8 @@ const int resolucao = 8;
 const int canal_A = 0;
 const int canal_B = 1;
 
+unsigned long ultimoTempo = 0;
+
 void frente(int incl);
 void tras(int incl);
 void receberDados(
@@ -36,8 +38,6 @@ void setup() {
   pinMode(inA2, OUTPUT);
   pinMode(inB1, OUTPUT);
   pinMode(inB2, OUTPUT);
-  // pinMode(but1, INPUT_PULLUP);
-  // pinMode(but2, INPUT_PULLUP);
 
   ledcAttachChannel(enA, frequencia, resolucao, canal_A);
   ledcAttachChannel(enB, frequencia, resolucao, canal_B);
@@ -62,6 +62,10 @@ void setup() {
 }
 
 void loop() {
+
+    if (millis() - ultimoTempo > 300) {
+      parar();
+    }
   
 }
 void decodificar(Codigo codigo) {
@@ -172,6 +176,8 @@ void receberDados(
   int tamanho
 ) {
   if(tamanho == sizeof(Codigo)) {
+
+    ultimoTempo = millis();
     
     Codigo codigo_recebido;
 
