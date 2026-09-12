@@ -336,5 +336,5 @@ void enviarCodigo(Codigo cod) {
     Serial.print("Dado enviado com sucesso: 0x");
     Serial.println((uint8_t)dadoEnviado, HEX);
   }
-
+  ultimoCodigo = cod;
 }
