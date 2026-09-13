@@ -30,7 +30,7 @@ typedef enum {
   DIREITA_TRAS = 0x06,
   ESQUERDA_FRENTE = 0x07,
   ESQUERDA_TRAS = 0x08,
-  PARAR = 0x09;
+  PARAR = 0x09
 } Codigo;
 
 void setup() {

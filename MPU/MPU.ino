@@ -1,32 +1,39 @@
 #include <Wire.h>
 #include "I2Cdev.h"
+#include "MPU6050.h"
 #include <WiFi.h>
 #include <esp_now.h>
-#include "MPU6050.h"
+#include <math.h>
+#include <string.h>
 
 MPU6050 mpu;
 
-long gyroXOffset = 0;
-long gyroYOffset = 0;
-long gyroZOffset = 0;
+// Offsets do giroscopio, em unidades brutas.
+float gyroXXOffset = 0.0f;
+float gyroZOffset = 0.0f;
 
-long accelXOffset = 0;
-long accelYOffset = 0;
-long accelZOffset = 0;
+float roll = 0.0f;
+float pitch = 0.0f;
 
-float roll = 0;
-float pitch = 0;
+const float ALPHA = 0.96f;
 
-const float ALPHA = 0.96;
+const float LIMITE_ATIVACAO = 10.0f;
+const float LIMITE_DESATIVACAO = 7.0f;
 
-const float LIMITE_ATIVACAO = 10.0;
-const float LIMITE_DESATIVACAO = 7.0;
+// Ajuste somente se o gesto comandar o sentido contrario.
+// Esses sinais alteram os comandos, sem modificar o filtro.
+const float SINAL_FRENTE = 1.0f;
+const float SINAL_DIREITA = 1.0f;
 
-unsigned long ultimoTempo;
+unsigned long ultimoTempo = 0;
 
+// MAC da interface Station do ESP32 receptor.
+uint8_t enderecoMAC[6] = {
+  0xA4, 0xF0, 0x0F, 0x83, 0x22, 0x78
+};
 
-uint8_t enderecoMAC[6] =  {0xA4,0xF0,0x0F,0x83,0x22,0x78};
-
+// Mantenha esta mesma definicao no receptor.
+// Nao altere apenas um dos lados para enum : uint8_t.
 typedef enum {
   FRENTE = 0x01,
   TRAS = 0x02,
@@ -40,195 +47,189 @@ typedef enum {
 Codigo ultimoCodigo = PARAR;
 Codigo atualCodigo = PARAR;
 
-void calibrarMPU() {
+const unsigned long INTERVALO_ENVIO = 100;
+unsigned long ultimoEnvio = 0;
+bool primeiroEnvio = true;
 
-  Serial.println();
-  Serial.println("=================================");
+// Prototipos explicitos para evitar problemas com tipos
+// personalizados no preprocessamento da Arduino IDE.
+void interromper(const char *mensagem);
+void calibrarMPU();
+void inicializarAngulos();
+void enviarCodigo(Codigo codigo);
+const char *determinarDirecao(float pitchComando, float rollComando);
+
+void interromper(const char *mensagem) {
+  Serial.println(mensagem);
+
+  // while (true) {
+  //   delay(1000);
+  // }
+}
+
+void calibrarMPU() {
+  Serial.println("\n=================================");
   Serial.println("       CALIBRANDO MPU6050");
   Serial.println("=================================");
-  Serial.println();
-
-  Serial.println("NAO MOVA O SENSOR!");
-  Serial.println("Aguarde...");
+  Serial.println("Mantenha o sensor parado.");
+  Serial.println("Posicao neutra: Y positivo na vertical.");
 
   delay(2000);
 
   const int NUM_AMOSTRAS = 2000;
 
-  long somaGX = 0;
-  long somaGY = 0;
-  long somaGZ = 0;
-
-  long somaAX = 0;
-  long somaAY = 0;
-  long somaAZ = 0;
+  int64_t somaGX = 0;
+  int64_t somaGZ = 0;
 
   for (int i = 0; i < NUM_AMOSTRAS; i++) {
-
     int16_t ax, ay, az;
     int16_t gx, gy, gz;
 
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
     somaGX += gx;
-    somaGY += gy;
     somaGZ += gz;
-
-    somaAX += ax;
-    somaAY += ay;
-    somaAZ += az;
 
     delay(2);
   }
 
-  gyroXOffset = somaGX / NUM_AMOSTRAS;
-  gyroYOffset = somaGY / NUM_AMOSTRAS;
-  gyroZOffset = somaGZ / NUM_AMOSTRAS;
+  gyroXOffset = (float)somaGX / NUM_AMOSTRAS;
+  gyroZOffset = (float)somaGZ / NUM_AMOSTRAS;
 
-  accelXOffset = somaAX / NUM_AMOSTRAS;
-  accelYOffset = somaAY / NUM_AMOSTRAS;
-  accelZOffset = somaAZ / NUM_AMOSTRAS;
-
-  Serial.println();
-  Serial.println("CALIBRACAO CONCLUIDA!");
-  Serial.println();
+  Serial.println("Calibracao concluida!");
 
   Serial.print("Gyro X offset: ");
-  Serial.println(gyroXOffset);
-
-  Serial.print("Gyro Y offset: ");
-  Serial.println(gyroYOffset);
+  Serial.println(gyroXOffset, 2);
 
   Serial.print("Gyro Z offset: ");
-  Serial.println(gyroZOffset);
+  Serial.println(gyroZOffset, 2);
+}
 
-  Serial.println();
+void inicializarAngulos() {
+  int16_t axRaw, ayRaw, azRaw;
+  int16_t gxRaw, gyRaw, gzRaw;
 
-  Serial.print("Accel X media: ");
-  Serial.println(accelXOffset);
+  mpu.getMotion6(
+    &axRaw, &ayRaw, &azRaw,
+    &gxRaw, &gyRaw, &gzRaw
+  );
 
-  Serial.print("Accel Y media (deve ficar proximo de ~16384, pois agora Y e o eixo vertical): ");
-  Serial.println(accelYOffset);
+  float ax = (float)axRaw;
+  float ay = (float)ayRaw;
+  float az = (float)azRaw;
 
-  Serial.print("Accel Z media: ");
-  Serial.println(accelZOffset);
+  roll = atan2f(az, ay) * 180.0f / PI;
 
-  Serial.println();
-
-  delay(2000);
+  pitch = atan2f(
+    -ax,
+    sqrtf(ay * ay + az * az)
+  ) * 180.0f / PI;
 }
 
 void setup() {
-
   Serial.begin(115200);
-
   delay(1000);
 
   Serial.println();
-  Serial.println("=================================");
-  Serial.println("       MPU6050 - CONTROLE");
-  Serial.println("=================================");
+  Serial.println("MPU6050 - CONTROLE DO CARRINHO");
 
   Wire.begin();
-
   mpu.initialize();
 
   if (!mpu.testConnection()) {
-
-    Serial.println("ERRO: MPU6050 NAO ENCONTRADO!");
-
-    while (1) {
-      delay(1000);
-    }
+    interromper("ERRO: MPU6050 nao encontrado!");
   }
 
-  Serial.println("MPU6050 conectado!");
+  // Garante a escala usada na conversao do giroscopio.
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
 
-  delay(1000);
-
+  delay(100);
   calibrarMPU();
 
-  // Inicializa o tempo
-  ultimoTempo = micros();
+  if (!WiFi.mode(WIFI_STA)) {
+    interromper("ERRO ao ativar Wi-Fi Station!");
+  }
 
-  Serial.println("Sistema pronto!");
-  Serial.println();
-
-  WiFi.mode(WIFI_STA);
-
-  if(esp_now_init() != ESP_OK) {
-    Serial.println("ERRO DE COMUNICAÇÂO");
+  if (esp_now_init() != ESP_OK) {
+    interromper("ERRO ao inicializar ESP-NOW!");
   }
 
   esp_now_peer_info_t infoMotores = {};
 
   memcpy(infoMotores.peer_addr, enderecoMAC, 6);
 
+  // Usa o canal atual do transmissor.
+  // O receptor precisa estar no mesmo canal.
   infoMotores.channel = 0;
+  infoMotores.ifidx = WIFI_IF_STA;
   infoMotores.encrypt = false;
 
-  if(esp_now_add_peer(&infoMotores) != ESP_OK) {
-    Serial.println("ERRO COMUNICACAO");
+  if (esp_now_add_peer(&infoMotores) != ESP_OK) {
+    interromper("ERRO ao adicionar o receptor!");
   }
+
+  // Inicializa o filtro e o tempo somente depois do setup.
+  inicializarAngulos();
+  ultimoTempo = micros();
+
+  enviarCodigo(PARAR);
+
+  Serial.println("Sistema pronto!");
 }
 
-
 void loop() {
-
   int16_t axRaw, ayRaw, azRaw;
   int16_t gxRaw, gyRaw, gzRaw;
 
   mpu.getMotion6(
-    &axRaw,
-    &ayRaw,
-    &azRaw,
-    &gxRaw,
-    &gyRaw,
-    &gzRaw
+    &axRaw, &ayRaw, &azRaw,
+    &gxRaw, &gyRaw, &gzRaw
   );
-
-  float gx = gxRaw - gyroXOffset;
-  float gz = gzRaw - gyroZOffset;
-
-  float ax = axRaw;
-  float ay = ayRaw;
-  float az = azRaw;
 
   unsigned long agora = micros();
 
-  float dt = (agora - ultimoTempo) / 1000000.0;
-
+  float dt = (agora - ultimoTempo) / 1000000.0f;
   ultimoTempo = agora;
 
-  if (dt <= 0 || dt > 0.1) {
-    dt = 0.01;
+  float ax = (float)axRaw;
+  float ay = (float)ayRaw;
+  float az = (float)azRaw;
+
+  // Sensibilidade para a escala de +/-250 graus/s.
+  float gyroX = ((float)gxRaw - gyroXOffset) / 131.0f;
+  float gyroZ = ((float)gzRaw - gyroZOffset) / 131.0f;
+
+  float rollAccel = atan2f(az, ay) * 180.0f / PI;
+
+  float pitchAccel = atan2f(
+    -ax,
+    sqrtf(ay * ay + az * az)
+  ) * 180.0f / PI;
+
+  if (dt <= 0.0f || dt > 0.1f) {
+    // Reinicializa o filtro se houver uma pausa longa.
+    roll = rollAccel;
+    pitch = pitchAccel;
+  } else {
+    roll =
+      ALPHA * (roll + gyroX * dt) +
+      (1.0f - ALPHA) * rollAccel;
+
+    // Para as formulas acima, com Y positivo na vertical,
+    // pitch usa o sinal negativo do giroscopio Z.
+    pitch =
+      ALPHA * (pitch - gyroZ * dt) +
+      (1.0f - ALPHA) * pitchAccel;
   }
 
-  float gyroX = gx / 131.0; 
-  float gyroZ = gz / 131.0; 
-
-  float rollAccel =
-      atan2(az, ay) * 180.0 / PI;
-
-  float pitchAccel =
-      atan2(
-        -ax,
-        sqrt(ay * ay + az * az)
-      )
-      * 180.0 / PI;
-
-  roll =
-      ALPHA * (roll + gyroX * dt)
-      + (1.0 - ALPHA) * rollAccel;
-
-  pitch =
-      ALPHA * (pitch + gyroZ * dt)  
-      + (1.0 - ALPHA) * pitchAccel;
-
-  String direcao = determinarDirecao(
-      pitch,
-      roll
+  const char *direcao = determinarDirecao(
+    SINAL_FRENTE * pitch,
+    SINAL_DIREITA * roll
   );
+
+  // Chamada continua para permitir o heartbeat.
+  enviarCodigo(atualCodigo);
 
   Serial.print("Pitch: ");
   Serial.print(pitch, 1);
@@ -237,104 +238,104 @@ void loop() {
   Serial.print(roll, 1);
 
   Serial.print(" | Direcao: ");
-
   Serial.println(direcao);
 
-
-  delay(30);
+  delay(10);
 }
 
-String determinarDirecao(float pitch, float roll) {
+const char *determinarDirecao(
+  float pitchComando,
+  float rollComando
+) {
+  bool estavaFrente =
+    atualCodigo == FRENTE ||
+    atualCodigo == DIREITA_FRENTE ||
+    atualCodigo == ESQUERDA_FRENTE;
 
-  bool frente;
-  bool tras;
-  bool direita;
-  bool esquerda;
+  bool estavaTras =
+    atualCodigo == TRAS ||
+    atualCodigo == DIREITA_TRAS ||
+    atualCodigo == ESQUERDA_TRAS;
 
-  if (atualCodigo == FRENTE) {
-    frente = pitch > LIMITE_DESATIVACAO;
-  } 
-  else {
-    frente = pitch > LIMITE_ATIVACAO;
-  }
+  bool estavaDireita =
+    atualCodigo == DIREITA_FRENTE ||
+    atualCodigo == DIREITA_TRAS;
 
-  if (atualCodigo == TRAS) {
-    tras = pitch < -LIMITE_DESATIVACAO;
-  } 
-  else {
-    tras = pitch < -LIMITE_ATIVACAO;
-  }
+  bool estavaEsquerda =
+    atualCodigo == ESQUERDA_FRENTE ||
+    atualCodigo == ESQUERDA_TRAS;
 
-  if (atualCodigo == DIREITA_FRENTE ||
-      atualCodigo == DIREITA_TRAS) {
-    direita = roll > LIMITE_DESATIVACAO;
-  } 
-  else {
-    direita = roll > LIMITE_ATIVACAO;
-  }
+  bool frente = pitchComando > (
+    estavaFrente ? LIMITE_DESATIVACAO : LIMITE_ATIVACAO
+  );
 
-  if (atualCodigo == ESQUERDA_FRENTE ||
-      atualCodigo == ESQUERDA_TRAS) {
-    esquerda = roll < -LIMITE_DESATIVACAO;
-  } 
-  else {
-    esquerda = roll < -LIMITE_ATIVACAO;
-  }
+  bool tras = pitchComando < -(
+    estavaTras ? LIMITE_DESATIVACAO : LIMITE_ATIVACAO
+  );
+
+  bool direita = rollComando > (
+    estavaDireita ? LIMITE_DESATIVACAO : LIMITE_ATIVACAO
+  );
+
+  bool esquerda = rollComando < -(
+    estavaEsquerda ? LIMITE_DESATIVACAO : LIMITE_ATIVACAO
+  );
 
   if (frente && direita) {
     atualCodigo = DIREITA_FRENTE;
-    enviarCodigo(atualCodigo);
     return "FRENTE DIREITA";
   }
 
   if (frente && esquerda) {
     atualCodigo = ESQUERDA_FRENTE;
-    enviarCodigo(atualCodigo);
     return "FRENTE ESQUERDA";
   }
 
   if (frente) {
     atualCodigo = FRENTE;
-    enviarCodigo(atualCodigo);
     return "FRENTE";
   }
 
   if (tras && direita) {
     atualCodigo = DIREITA_TRAS;
-    enviarCodigo(atualCodigo);
     return "TRAS DIREITA";
   }
 
   if (tras && esquerda) {
     atualCodigo = ESQUERDA_TRAS;
-    enviarCodigo(atualCodigo);
     return "TRAS ESQUERDA";
   }
 
   if (tras) {
     atualCodigo = TRAS;
-    enviarCodigo(atualCodigo);
     return "TRAS";
   }
 
+  // Inclinacao apenas lateral continua resultando em PARAR.
   atualCodigo = PARAR;
-  enviarCodigo(atualCodigo);
   return "PARADO";
-  
 }
-void enviarCodigo(Codigo cod) {
 
-  if (cod == ultimoCodigo) {
+void enviarCodigo(Codigo codigo) {
+  unsigned long agora = millis();
+
+  // Mudou o comando: envia na proxima passagem do loop.
+  // Comando igual: repete apos aproximadamente 100 ms.
+  if (!primeiroEnvio &&
+      codigo == ultimoCodigo &&
+      agora - ultimoEnvio < INTERVALO_ENVIO) {
     return;
   }
 
-  Codigo dadoEnviado = cod;
-  esp_err_t resultadoComunicacao = esp_now_send(enderecoMAC, 
-  (uint8_t *)&dadoEnviado, sizeof(dadoEnviado));
+  esp_err_t resultado = esp_now_send(
+    enderecoMAC,
+    reinterpret_cast<const uint8_t *>(&codigo),
+    sizeof(codigo)
+  );
 
-  if(resultadoComunicacao == ESP_OK) {
-    Serial.print("Dado enviado com sucesso: 0x");
-    Serial.println((uint8_t)dadoEnviado, HEX);
+  if (resultado == ESP_OK) {
+    ultimoCodigo = codigo;
+    ultimoEnvio = agora;
+    primeiroEnvio = false;
   }
-  ultimoCodigo = cod;
 }
