@@ -9,7 +9,7 @@
 MPU6050 mpu;
 
 // Offsets do giroscopio, em unidades brutas.
-float gyroXXOffset = 0.0f;
+float gyroXOffset = 0.0f;
 float gyroZOffset = 0.0f;
 
 float roll = 0.0f;
