@@ -62,9 +62,9 @@ const char *determinarDirecao(float pitchComando, float rollComando);
 void interromper(const char *mensagem) {
   Serial.println(mensagem);
 
-  // while (true) {
-  //   delay(1000);
-  // }
+  while (true) {
+   delay(1000);
+   }
 }
 
 void calibrarMPU() {
