@@ -1,6 +1,17 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <string.h>
+
+// Arduino-ESP32 3.x. Motor A = lado esquerdo; B = lado direito.
+// Confira se estes GPIOs estao livres na sua variante de ESP32.
+const uint8_t CANAL_WIFI = 1;  // Igual no transmissor.
+const int SINAL_MOTOR_A = 1;   // Use -1 se este motor estiver invertido.
+const int SINAL_MOTOR_B = 1;
+const int PWM_MAXIMO = 255;
+const int PWM_CURVA = PWM_MAXIMO / 2;
+static_assert(PWM_MAXIMO > 0 && PWM_MAXIMO <= 255, "PWM deve estar entre 1 e 255");
 
 // Pinos originais.
 const int inA1 = 4;
@@ -33,16 +44,18 @@ typedef enum {
 
 // Confirma o formato esperado pelo transmissor fornecido.
 static_assert(
-  sizeof(Codigo) == sizeof(int),
-  "O enum deve ter o mesmo tamanho de int"
+  sizeof(Codigo) == 4 && sizeof(int) == 4,
+  "Protocolo requer comandos de 4 bytes"
 );
 
 // Protege os dados compartilhados entre callback e loop.
 portMUX_TYPE travaDados = portMUX_INITIALIZER_UNLOCKED;
 
 Codigo comandoRecebido = PARAR;
-unsigned long ultimoTempo = 0;
+uint32_t ultimoTempo = 0;
 bool recebeuPacote = false;
+uint32_t pacotesRecebidos = 0;
+bool movimentoLiberado = false;
 
 // Estado dos motores: positivo = frente; negativo = tras.
 int pwmAtualA = 0;
@@ -68,6 +81,7 @@ void aplicarMotor(int pino1, int pino2, int enable, int pwm);
 void atualizarRampa();
 void parar();
 void interromper(const char *mensagem);
+void diagnosticar(Codigo codigo, bool conectado, uint32_t pacotes);
 
 void setup() {
   Serial.begin(115200);
@@ -105,6 +119,10 @@ void setup() {
     interromper("ERRO ao iniciar Wi-Fi Station!");
   }
 
+  if (esp_wifi_set_channel(CANAL_WIFI, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+    interromper("ERRO ao configurar canal Wi-Fi!");
+  }
+
   Serial.print("MAC Station do receptor: ");
   Serial.println(WiFi.macAddress());
 
@@ -124,30 +142,57 @@ void setup() {
 
 void loop() {
   Codigo codigo;
-  unsigned long recebidoEm;
+  uint32_t recebidoEm, pacotes;
   bool temPacote;
-
-  // Copia comando e horario juntos, de forma protegida.
   portENTER_CRITICAL(&travaDados);
   codigo = comandoRecebido;
   recebidoEm = ultimoTempo;
   temPacote = recebeuPacote;
+  pacotes = pacotesRecebidos;
   portEXIT_CRITICAL(&travaDados);
 
-  unsigned long agora = millis();
-
-  if (!temPacote ||
-      codigo == PARAR ||
-      agora - recebidoEm >= TIMEOUT_COMUNICACAO) {
+  uint32_t agora = millis();
+  bool conectado = temPacote &&
+      static_cast<uint32_t>(agora - recebidoEm) < TIMEOUT_COMUNICACAO;
+  if (!conectado) {
+    movimentoLiberado = false;
     parar();
-    delay(1);
-    return;
+  } else if (codigo == PARAR) {
+    // Apos ligar/perder sinal, exige PARAR novo antes de aceitar movimento.
+    movimentoLiberado = true;
+    parar();
+  } else if (!movimentoLiberado) {
+    parar();
+  } else {
+    decodificar(codigo);
+    atualizarRampa();
   }
-
-  decodificar(codigo);
-  atualizarRampa();
-
+  diagnosticar(codigo, conectado, pacotes);
   delay(1);
+}
+
+void diagnosticar(Codigo codigo, bool conectado, uint32_t pacotes) {
+  static bool primeiro = true, anteriorConectado = false, anteriorLiberado = false;
+  static Codigo anteriorCodigo = PARAR;
+  static uint32_t ultimoLog = 0;
+  uint32_t agora = millis();
+  if (!primeiro && conectado == anteriorConectado &&
+      movimentoLiberado == anteriorLiberado && codigo == anteriorCodigo &&
+      static_cast<uint32_t>(agora - ultimoLog) < 1000) return;
+  primeiro = false;
+  anteriorConectado = conectado;
+  anteriorLiberado = movimentoLiberado;
+  anteriorCodigo = codigo;
+  ultimoLog = agora;
+  if (!conectado) {
+    Serial.println("SEM SINAL: motores desligados. Aguarde sinal e retorne ao neutro.");
+  } else if (!movimentoLiberado) {
+    Serial.println("SINAL RECEBIDO: retorne ao neutro para liberar os motores.");
+  } else {
+    Serial.printf("RX: 0x%02X | pacotes: %lu | PWM A: %d B: %d\n",
+                  static_cast<unsigned>(codigo), static_cast<unsigned long>(pacotes),
+                  pwmAtualA, pwmAtualB);
+  }
 }
 
 bool codigoValido(int codigo) {
@@ -193,40 +238,42 @@ void receberDados(
   comandoRecebido = static_cast<Codigo>(valor);
   ultimoTempo = agora;
   recebeuPacote = true;
+  ++pacotesRecebidos;
   portEXIT_CRITICAL(&travaDados);
 }
 
 void decodificar(Codigo codigo) {
-  // Preserva o mapeamento de motores do codigo original.
+  // Preserva as curvas originais, inclusive em marcha a re.
+  // Na re, direita indica o lado para onde a traseira descreve a curva.
   switch (codigo) {
     case FRENTE:
-      pwmAlvoA = 255;
-      pwmAlvoB = 255;
+      pwmAlvoA = PWM_MAXIMO;
+      pwmAlvoB = PWM_MAXIMO;
       break;
 
     case TRAS:
-      pwmAlvoA = -255;
-      pwmAlvoB = -255;
+      pwmAlvoA = -PWM_MAXIMO;
+      pwmAlvoB = -PWM_MAXIMO;
       break;
 
     case DIREITA_FRENTE:
-      pwmAlvoA = 255;
-      pwmAlvoB = 127;
+      pwmAlvoA = PWM_MAXIMO;
+      pwmAlvoB = PWM_CURVA;
       break;
 
     case ESQUERDA_FRENTE:
-      pwmAlvoA = 127;
-      pwmAlvoB = 255;
+      pwmAlvoA = PWM_CURVA;
+      pwmAlvoB = PWM_MAXIMO;
       break;
 
     case DIREITA_TRAS:
-      pwmAlvoA = -255;
-      pwmAlvoB = -127;
+      pwmAlvoA = -PWM_MAXIMO;
+      pwmAlvoB = -PWM_CURVA;
       break;
 
     case ESQUERDA_TRAS:
-      pwmAlvoA = -127;
-      pwmAlvoB = -255;
+      pwmAlvoA = -PWM_CURVA;
+      pwmAlvoB = -PWM_MAXIMO;
       break;
 
     default:
@@ -286,8 +333,8 @@ void atualizarRampa() {
   pwmAtualA = aproximarPWM(pwmAtualA, pwmAlvoA);
   pwmAtualB = aproximarPWM(pwmAtualB, pwmAlvoB);
 
-  aplicarMotor(inA1, inA2, enA, pwmAtualA);
-  aplicarMotor(inB1, inB2, enB, pwmAtualB);
+  aplicarMotor(inA1, inA2, enA, SINAL_MOTOR_A * pwmAtualA);
+  aplicarMotor(inB1, inB2, enB, SINAL_MOTOR_B * pwmAtualB);
 }
 
 void parar() {
